@@ -333,11 +333,18 @@ pub struct DriftOptions {
     pub max_windows: usize,
     /// PHAT weighting exponent, as in [`SyncOptions`].
     pub phat_beta: f32,
+    /// A window is trusted when its peak stands this many times over the RMS of the lags searched.
+    pub min_peak: f32,
+    /// ... and this many times over the highest rival more than 2 ms away.
+    pub min_distinct: f32,
 }
 
 impl Default for DriftOptions {
     fn default() -> Self {
-        Self { max_ppm: 300.0, window: 1 << 16, max_windows: 32, phat_beta: 0.75 }
+        // Window and bars chosen on seven real clips of one pair of recorders (a clip-on microphone and a
+        // handheld phone across a room): longer windows and a lower bar gave the most clips that agree with
+        // each other; the fit and `reliable` do the rest.
+        Self { max_ppm: 300.0, window: 1 << 17, max_windows: 32, phat_beta: 0.75, min_peak: 4.0, min_distinct: 1.1 }
     }
 }
 
@@ -449,7 +456,7 @@ pub fn find_drift(a: &[f32], b: &[f32], sample_rate: u32, base: &SyncResult, opt
             }
         }
         // a clear peak: well over the floor of the searched range and over any rival
-        if peak < 6.0 * rms || (second > 0.0 && peak < 1.3 * second) {
+        if peak < opts.min_peak * rms || (second > 0.0 && peak < opts.min_distinct * second) {
             continue;
         }
         let (y0, y1, y2) = (corr_at(&r, best.0 - 1) * sign, peak, corr_at(&r, best.0 + 1) * sign);
