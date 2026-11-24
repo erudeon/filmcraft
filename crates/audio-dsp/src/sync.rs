@@ -20,6 +20,18 @@
 //!
 //! References: Knapp & Carter, "The generalized correlation method for estimation of time delay",
 //! IEEE Trans. ASSP 24(4), 1976; the β-weighted PHAT variant is standard textbook practice.
+//!
+//! # Clock drift
+//!
+//! Two recorders never run at exactly the same sample rate: a phone and a camera commonly differ
+//! by tens of parts per million, which is a frame of picture every ten to twenty minutes. One lag
+//! cannot describe that. [`find_drift`] measures the lag again in windows spread over the common
+//! stretch (the same GCC-PHAT-β, searched only as far as the largest drift allowed could have
+//! moved it) and fits a line through the windows that gave a clear peak: its slope is the drift
+//! and its value at any sample of `b` is the lag there. The fit is a Theil-Sen estimate (median of
+//! the pairwise slopes; Sen, "Estimates of the regression coefficient based on Kendall's tau",
+//! JASA 63, 1968), so a few windows that locked onto an echo or a repeat do not bend it, followed
+//! by least squares over the windows that agree with it.
 
 use crate::fft::Fft;
 
@@ -310,6 +322,186 @@ pub fn find_offset(a: &[f32], b: &[f32], sample_rate: u32, opts: &SyncOptions) -
     Some(SyncResult { lag, lag_fine: lag as f64 + frac as f64, confidence, distinct, inverted })
 }
 
+/// Tuning of [`find_drift`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DriftOptions {
+    /// Largest clock difference looked for, in parts per million.
+    pub max_ppm: f64,
+    /// Length of each measuring window (samples).
+    pub window: usize,
+    /// Most windows measured; they are spread evenly over the common stretch.
+    pub max_windows: usize,
+    /// PHAT weighting exponent, as in [`SyncOptions`].
+    pub phat_beta: f32,
+    /// A window is trusted when its peak stands this many times over the RMS of the lags searched.
+    pub min_peak: f32,
+    /// ... and this many times over the highest rival more than 2 ms away.
+    pub min_distinct: f32,
+}
+
+impl Default for DriftOptions {
+    fn default() -> Self {
+        // Window and bars chosen on seven real clips of one pair of recorders (a clip-on microphone and a
+        // handheld phone across a room): longer windows and a lower bar gave the most clips that agree with
+        // each other; the fit and `reliable` do the rest.
+        Self { max_ppm: 300.0, window: 1 << 17, max_windows: 32, phat_beta: 0.75, min_peak: 4.0, min_distinct: 1.1 }
+    }
+}
+
+/// The clock drift between two recordings: `b[n]` lines up with
+/// `a[n · (1 + ppm · 10⁻⁶) + lag_at_start]`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DriftResult {
+    /// How much the lag grows per million samples of `b`. Positive: `b`'s clock runs slow, so
+    /// each of its samples covers more of `a`'s time.
+    pub ppm: f64,
+    /// The lag at `b`'s first sample (samples at the input rate), from the fitted line.
+    pub lag_at_start: f64,
+    /// RMS distance of the trusted windows' lags from the fitted line (samples).
+    pub residual: f64,
+    /// Windows that gave a clear peak and agree with the line.
+    pub windows: usize,
+    /// Windows measured.
+    pub tried: usize,
+    /// Share of the common stretch between the first and the last trusted window (0..1).
+    pub span: f64,
+    /// True when the recordings correlate negatively, as most trusted windows hear it. Drift
+    /// smears the whole-recording correlation that [`find_offset`] takes its polarity from, so
+    /// under drift this is the figure to use.
+    pub inverted: bool,
+}
+
+impl DriftResult {
+    /// The lag at sample `n` of `b`.
+    pub fn lag_at(&self, n: f64) -> f64 {
+        self.lag_at_start + n * self.ppm * 1e-6
+    }
+
+    /// Whether enough of the recording agrees on one line to trust the drift: at least six windows
+    /// over at least half of the common stretch, within a third of a millisecond of the line at
+    /// 48 kHz (16 samples).
+    pub fn reliable(&self) -> bool {
+        self.windows >= 6 && self.span >= 0.5 && self.residual <= 16.0
+    }
+}
+
+fn median(v: &mut [f64]) -> f64 {
+    if v.is_empty() {
+        return 0.0;
+    }
+    v.sort_by(f64::total_cmp);
+    let m = v.len() / 2;
+    if v.len() % 2 == 1 { v[m] } else { 0.5 * (v[m - 1] + v[m]) }
+}
+
+/// Measure the clock drift between `a` and `b` around the lag `base` that [`find_offset`] found
+/// for them (see the module docs). `None` when the common stretch is shorter than four windows or
+/// fewer than four windows give a clear peak.
+pub fn find_drift(a: &[f32], b: &[f32], sample_rate: u32, base: &SyncResult, opts: &DriftOptions) -> Option<DriftResult> {
+    let sr = sample_rate.max(1) as f32;
+    let w = opts.window.clamp(1 << 10, 1 << 20) as i64;
+    let (fa, fb) = (a.len() as i64, b.len() as i64);
+    let lag = base.lag;
+    let ov0 = (-lag).max(0);
+    let ov1 = fb.min(fa - lag);
+    let len = ov1 - ov0;
+    if len < 4 * w {
+        return None;
+    }
+    // how far the largest drift allowed could have moved the lag anywhere in the common stretch
+    let margin = (((opts.max_ppm.abs() * 1e-6 * len as f64).ceil() as i64) + 16).min(w);
+    let k = ((len / w) as usize).min(opts.max_windows.max(4));
+    let step = (len - w) as f64 / (k - 1) as f64;
+    let starts: Vec<i64> = (0..k).map(|i| ov0 + (i as f64 * step).round() as i64).collect();
+    let energy = |x: &[f32], from: i64, n: i64| -> f64 {
+        let lo = from.clamp(0, x.len() as i64) as usize;
+        let hi = (from + n).clamp(0, x.len() as i64) as usize;
+        x[lo..hi].iter().map(|&v| (v as f64) * (v as f64)).sum()
+    };
+    let energies: Vec<f64> = starts.iter().map(|&s| energy(b, s, w).min(energy(a, s + lag, w))).collect();
+    let floor = 0.05 * median(&mut energies.clone());
+    let guard = ((sr * 0.002) as i64).max(2);
+    // (centre of the window in b, lag there, polarity heard)
+    let mut heard: Vec<(f64, f64, bool)> = Vec::with_capacity(k);
+    for (&s, &e) in starts.iter().zip(&energies) {
+        if e <= floor.max(1e-12) {
+            continue; // a pause: nothing to line up
+        }
+        let mut bw: Vec<f32> = b[s as usize..(s + w) as usize].to_vec();
+        let mut aw: Vec<f32> = (s + lag - margin..s + lag + w + margin).map(|i| if i >= 0 && i < fa { a[i as usize] } else { 0.0 }).collect();
+        normalise(&mut aw);
+        normalise(&mut bw);
+        let n2 = (aw.len() + bw.len()).next_power_of_two();
+        let r = gcc(&aw, &bw, n2, opts.phat_beta, (20.0 / sr, 0.5));
+        // the highest peak of either sign: the polarity is heard here, not taken from `base`
+        let mut best = (0i64, 0.0f32);
+        let mut sum2 = 0.0f64;
+        for l in 0..=2 * margin {
+            let v = corr_at(&r, l);
+            sum2 += (v as f64) * (v as f64);
+            if v.abs() > best.1.abs() {
+                best = (l, v);
+            }
+        }
+        if best.1 == 0.0 {
+            continue;
+        }
+        let sign = best.1.signum();
+        let peak = best.1.abs();
+        let rms = (sum2 / (2 * margin + 1) as f64).sqrt().max(1e-30) as f32;
+        let mut second = 0.0f32;
+        for l in 0..=2 * margin {
+            if (l - best.0).abs() > guard {
+                second = second.max(corr_at(&r, l).abs());
+            }
+        }
+        // a clear peak: well over the floor of the searched range and over any rival
+        if peak < opts.min_peak * rms || (second > 0.0 && peak < opts.min_distinct * second) {
+            continue;
+        }
+        let (y0, y1, y2) = (corr_at(&r, best.0 - 1) * sign, peak, corr_at(&r, best.0 + 1) * sign);
+        let den = y0 - 2.0 * y1 + y2;
+        let frac = if den.abs() > 1e-20 { (0.5 * (y0 - y2) / den).clamp(-0.5, 0.5) } else { 0.0 };
+        heard.push(((s + w / 2) as f64, (lag + best.0 - margin) as f64 + frac as f64, sign < 0.0));
+    }
+    // one polarity for the pair: what most windows heard; the others matched something else
+    let inverted = 2 * heard.iter().filter(|h| h.2).count() > heard.len();
+    let points: Vec<(f64, f64)> = heard.iter().filter(|h| h.2 == inverted).map(|h| (h.0, h.1)).collect();
+    if points.len() < 4 {
+        return None;
+    }
+    // Theil-Sen: the median pairwise slope, then the median offset from it
+    let mut slopes = Vec::with_capacity(points.len() * (points.len() - 1) / 2);
+    for (i, p) in points.iter().enumerate() {
+        for q in &points[i + 1..] {
+            if q.0 > p.0 {
+                slopes.push((q.1 - p.1) / (q.0 - p.0));
+            }
+        }
+    }
+    let slope0 = median(&mut slopes);
+    let at0 = median(&mut points.iter().map(|p| p.1 - slope0 * p.0).collect::<Vec<_>>());
+    let mut dist: Vec<f64> = points.iter().map(|p| (p.1 - (at0 + slope0 * p.0)).abs()).collect();
+    let limit = (3.0 * 1.4826 * median(&mut dist.clone())).max(2.0);
+    dist = points.iter().map(|p| (p.1 - (at0 + slope0 * p.0)).abs()).collect();
+    let kept: Vec<(f64, f64)> = points.iter().zip(&dist).filter(|(_, d)| **d <= limit).map(|(p, _)| *p).collect();
+    if kept.len() < 4 {
+        return None;
+    }
+    // least squares over the windows that agree
+    let n = kept.len() as f64;
+    let (mx, my) = (kept.iter().map(|p| p.0).sum::<f64>() / n, kept.iter().map(|p| p.1).sum::<f64>() / n);
+    let sxx: f64 = kept.iter().map(|p| (p.0 - mx) * (p.0 - mx)).sum();
+    if sxx <= 0.0 {
+        return None;
+    }
+    let slope = kept.iter().map(|p| (p.0 - mx) * (p.1 - my)).sum::<f64>() / sxx;
+    let lag_at_start = my - slope * mx;
+    let residual = (kept.iter().map(|p| (p.1 - (lag_at_start + slope * p.0)).powi(2)).sum::<f64>() / n).sqrt();
+    let (first, last) = (kept.iter().map(|p| p.0).fold(f64::INFINITY, f64::min), kept.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max));
+    Some(DriftResult { ppm: slope * 1e6, lag_at_start, residual, windows: kept.len(), tried: k, span: (last - first) / len as f64, inverted })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -553,5 +745,89 @@ mod tests {
                 assert!(r.reliable(), "{r:?}");
             }
         }
+    }
+
+    /// `x` as a recorder with its own clock hears it: `out[n] = x(n · (1 + slope) + lag)`, by
+    /// four-point (Catmull-Rom) interpolation.
+    fn other_clock(x: &[f32], lag: f64, slope: f64, len: usize) -> Vec<f32> {
+        (0..len)
+            .map(|n| {
+                let t = n as f64 * (1.0 + slope) + lag;
+                let i = t.floor() as i64;
+                let f = (t - i as f64) as f32;
+                let at = |j: i64| if j >= 0 && (j as usize) < x.len() { x[j as usize] } else { 0.0 };
+                let (p0, p1, p2, p3) = (at(i - 1), at(i), at(i + 1), at(i + 2));
+                p1 + 0.5 * f * (p2 - p0 + f * (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3 + f * (3.0 * (p1 - p2) + p3 - p0)))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn drift_between_two_clocks_is_measured_with_its_sign() {
+        let sr = 16_000u32;
+        let a = speechy(sr as f64, 150.0, 11);
+        for (slope, lag0) in [(60e-6, 8_000.0), (-38e-6, 31_234.5)] {
+            let len = 2_000_000usize; // 125 s of b
+            let b = other_clock(&a, lag0, slope, len);
+            let base = find_offset(&a, &b, sr, &SyncOptions::default()).unwrap();
+            let d = find_drift(&a, &b, sr, &base, &DriftOptions::default()).unwrap();
+            assert!(d.reliable() && !d.inverted, "{d:?}");
+            assert_eq!(d.ppm > 0.0, slope > 0.0, "{d:?}");
+            assert!((d.ppm - slope * 1e6).abs() < 3.0, "{} against {}", d.ppm, slope * 1e6);
+            // the line holds at both ends of the recording, where one lag does not
+            let end = (len - 1) as f64;
+            let truth = |n: f64| lag0 + n * slope;
+            assert!((d.lag_at(0.0) - truth(0.0)).abs() < 1.0 && (d.lag_at(end) - truth(end)).abs() < 1.0, "{d:?}");
+            let single_lag_miss = (base.lag_fine - truth(0.0)).abs().max((base.lag_fine - truth(end)).abs());
+            assert!(single_lag_miss > 20.0 * (d.lag_at(end) - truth(end)).abs().max(0.5), "one lag misses by {single_lag_miss}");
+        }
+    }
+
+    #[test]
+    fn polarity_is_heard_in_the_windows_when_drift_blurs_the_whole() {
+        let sr = 16_000u32;
+        let a = speechy(sr as f64, 150.0, 11);
+        let flipped: Vec<f32> = other_clock(&a, 8_000.0, 60e-6, 2_000_000).iter().map(|v| -v).collect();
+        let straight = other_clock(&a, 8_000.0, 60e-6, 2_000_000);
+        for (b, turned) in [(&flipped, true), (&straight, false)] {
+            let base = find_offset(&a, b, sr, &SyncOptions::default()).unwrap();
+            let d = find_drift(&a, b, sr, &base, &DriftOptions::default()).unwrap();
+            assert_eq!(d.inverted, turned, "base {base:?} drift {d:?}");
+        }
+    }
+
+    #[test]
+    fn the_same_clock_reads_as_no_drift() {
+        let sr = 16_000u32;
+        let a = speechy(sr as f64, 80.0, 12);
+        let b = mic(&a, 4_321.0, 0.6, Some(0.2), 25.0, 1_000_000, 5);
+        let base = find_offset(&a, &b, sr, &SyncOptions::default()).unwrap();
+        let d = find_drift(&a, &b, sr, &base, &DriftOptions::default()).unwrap();
+        assert!(d.ppm.abs() < 1.0 && d.reliable(), "{d:?}");
+    }
+
+    #[test]
+    fn pauses_and_noise_cost_windows_not_the_drift() {
+        let sr = 16_000u32;
+        let a = speechy(sr as f64, 150.0, 13);
+        let slope = 45e-6;
+        let len = 2_000_000usize;
+        let clean = other_clock(&a, 12_000.0, slope, len);
+        let mut b = mic(&clean, 0.0, 0.8, Some(0.15), 12.0, len, 9);
+        // a third of the take with the second microphone switched off
+        b[600_000..1_250_000].iter_mut().for_each(|v| *v = 0.0);
+        let base = find_offset(&a, &b, sr, &SyncOptions::default()).unwrap();
+        let d = find_drift(&a, &b, sr, &base, &DriftOptions::default()).unwrap();
+        assert!(d.windows < d.tried, "{d:?}");
+        assert!((d.ppm - slope * 1e6).abs() < 5.0, "{d:?}");
+    }
+
+    #[test]
+    fn a_short_common_stretch_gives_no_drift_rather_than_a_guess() {
+        let sr = 16_000u32;
+        let a = speechy(sr as f64, 20.0, 14);
+        let b = other_clock(&a, 1_000.0, 80e-6, 150_000); // under four windows
+        let base = find_offset(&a, &b, sr, &SyncOptions::default()).unwrap();
+        assert_eq!(find_drift(&a, &b, sr, &base, &DriftOptions::default()), None);
     }
 }

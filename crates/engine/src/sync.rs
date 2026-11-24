@@ -14,7 +14,7 @@
 //!
 //! `offset` (frames) shifts every clip but the reference by that much (a known delay to correct).
 
-use filmcraft_audio_dsp::sync::{SyncOptions, SyncResult, find_offset, mixdown};
+use filmcraft_audio_dsp::sync::{DriftOptions, DriftResult, SyncOptions, SyncResult, find_drift, find_offset, mixdown};
 use filmcraft_project::{ItemId, Project, TrackItem};
 use filmcraft_time::{FrameRate, TICKS_PER_SECOND, Tick, TimeRange};
 use serde_json::{Value, json};
@@ -173,6 +173,9 @@ pub fn clip_audio(s: &Session, c: &SyncClip) -> Option<Vec<f32>> {
 pub struct Anchor {
     pub anchor: Tick,
     pub audio: Option<SyncResult>,
+    /// For audio: the clock drift against the reference, when enough of the common stretch gives
+    /// a clear match. Reported, not yet applied: the anchor is still the single offset.
+    pub drift: Option<DriftResult>,
 }
 
 /// Compute the anchors of `clips` (index `reference` is the reference for audio and `offset`).
@@ -190,22 +193,22 @@ pub fn anchors(s: &Session, clips: &[SyncClip], reference: usize, method: &Metho
     };
     for (i, c) in clips.iter().enumerate() {
         let a = match method {
-            Method::In => Anchor { anchor: c.in_point, audio: None },
-            Method::Out => Anchor { anchor: c.out_point, audio: None },
+            Method::In => Anchor { anchor: c.in_point, audio: None, drift: None },
+            Method::Out => Anchor { anchor: c.out_point, audio: None, drift: None },
             Method::Timecode { ignore_hours } => {
                 let tc = if *ignore_hours { Tick(c.timecode.0.rem_euclid(hour.0)) } else { c.timecode };
-                Anchor { anchor: Tick::ZERO - tc, audio: None }
+                Anchor { anchor: Tick::ZERO - tc, audio: None, drift: None }
             }
             Method::Marker { name } => {
                 let m =
                     c.markers.iter().filter(|(_, n)| name.as_deref().is_none_or(|w| n.eq_ignore_ascii_case(w))).map(|(t, _)| *t).min().ok_or_else(|| {
                         EngineError::Other(format!("{} has no clip marker{}", c.name, name.as_ref().map(|n| format!(" named “{n}”")).unwrap_or_default()))
                     })?;
-                Anchor { anchor: m, audio: None }
+                Anchor { anchor: m, audio: None, drift: None }
             }
             Method::Audio => {
                 if i == reference {
-                    Anchor { anchor: c.range.start, audio: None }
+                    Anchor { anchor: c.range.start, audio: None, drift: None }
                 } else {
                     let a = ref_audio.as_deref().unwrap_or_default();
                     let b = clip_audio(s, c).ok_or_else(|| EngineError::Other(format!("{} has no audio to synchronize by", c.name)))?;
@@ -214,7 +217,8 @@ pub fn anchors(s: &Session, clips: &[SyncClip], reference: usize, method: &Metho
                     // b[n] (media r0_i + n) lines up with a[n + L] (media r0_ref + n + L); with the
                     // reference anchored at r0_ref, equal common times give anchor_i = r0_i − L
                     let lag = Tick::from_units(r.lag, ANALYSIS_RATE as i64);
-                    Anchor { anchor: c.range.start - lag, audio: Some(r) }
+                    let drift = find_drift(a, &b, ANALYSIS_RATE, &r, &DriftOptions::default());
+                    Anchor { anchor: c.range.start - lag, audio: Some(r), drift }
                 }
             }
         };
@@ -254,6 +258,10 @@ pub fn report(clips: &[SyncClip], anchors: &[Anchor], starts: &[Tick], rate: Fra
                     "startFrame": rate.frame_at(*st),
                     "anchor": a.anchor.0,
                     "audio": a.audio.map(|r| json!({"lagSamples": r.lag, "lagFine": r.lag_fine, "confidence": r.confidence, "distinct": r.distinct, "reliable": r.reliable(), "inverted": r.inverted})),
+                    // Clock drift against the reference (samples at the analysis rate). The clips are still
+                    // placed by the one offset above: over `lagAtEnd - lagAtStart` they slide apart.
+                    "drift": a.drift.map(|d| json!({"ppm": d.ppm, "lagAtStart": d.lag_at_start, "lagAtEnd": d.lag_at(c.range.duration.min(MAX_ANALYSIS).to_units_floor(ANALYSIS_RATE as i64) as f64),
+                        "residualSamples": d.residual, "windows": d.windows, "tried": d.tried, "span": d.span, "reliable": d.reliable(), "inverted": d.inverted})),
                 })
             })
             .collect(),
